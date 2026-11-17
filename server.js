@@ -2,6 +2,14 @@
 // Node.js stdlib only (+ snarkjs for local Groth16 proving).
 // No frameworks. Secrets ONLY from env vars. Never log secrets.
 //
+// REDIS PATCH (2026-11-17, see REDIS_PATCH_NOTES.md): the proof_tx
+// seen-set is ALSO kept in Upstash Redis (REST API, no new dependency —
+// plain global fetch), because seen.json on Railway's ephemeral disk is
+// wiped on every redeploy (R04: seen_proof_refs 10 -> 2 after the 04:00 WIB
+// Kurier redeploy). Redis is the durable source of truth; the local file +
+// in-memory Set stay as cache + fallback. A Redis outage must NEVER fail a
+// task: every Redis call has a 2s timeout and falls back to the local set.
+//
 // Protocol sources (public, 15 Nov 2026):
 //   https://agentgames.zkverify.io/build
 //   https://agentgames.zkverify.io/events/proof-gatekeeper
@@ -32,6 +40,25 @@ const VK_HASH = process.env.GATEKEEPER_VK_HASH || '0x6b79c6012a6d8651f3e13bc4d2a
 const FIELD_MODULUS = BigInt('21888242871839275222246405745257275088548364400416034343698204186575808495617');
 const PROOF_TIMEOUT_MS = parseInt(process.env.GATEKEEPER_PROOF_TIMEOUT_MS || '45000', 10);
 
+// ---------------------------------------------------------------- Redis
+// Persistent seen-set via Upstash Redis REST (free tier). Enabled only when
+// BOTH UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set.
+// Key: "seen-proof-tx" (a SET). Protocol is the Upstash REST command
+// format, same as hi5's reference implementation: POST the base URL with a
+// JSON body ["SISMEMBER"|"SADD"|"SCARD", "seen-proof-tx", member?]
+// and `Authorization: Bearer <token>`. No new npm dependency.
+// GATEKEEPER_REDIS_BACKFILL=1 enables the one-time guarded seed below;
+// GATEKEEPER_SEEN_EXPORT=1 enables the guarded GET /seen snapshot endpoint.
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_ENABLED = Boolean(REDIS_URL && REDIS_TOKEN);
+const REDIS_KEY = 'seen-proof-tx';
+const REDIS_TIMEOUT_MS = 2000;
+// Cached SCARD result (null = unknown / not yet fetched). /health reports
+// this alongside the local count; it is refreshed at startup and bumped on
+// each successful SADD. It is a cache, never a decision input.
+let redisSeenCount = null;
+
 if (!HMAC_SECRET) {
   console.warn('[gatekeeper] WARNING: AGENT_GAMES_HMAC_SECRET is not set. ' +
     'Inbound HMAC verification and response signing are DISABLED until it is set. ' +
@@ -52,6 +79,120 @@ const decisionsByTask = loadJson(DECISIONS_PATH, {});
 
 let vk = null;
 try { vk = JSON.parse(fs.readFileSync(VK_PATH, 'utf8')); } catch (e) { console.warn('[gatekeeper] vk.json not found, local proof verification disabled:', e.message); }
+
+// ------------------------------------------------- Redis seen-set helpers
+// Every helper is non-fatal by design: on any error/timeout it logs a
+// warning and the caller proceeds on the local set. Redis must never fail
+// a task (the decision matters more than the reuse record).
+function redisSignal() {
+  // AbortSignal.timeout exists on Node >= 18; keep a manual fallback so
+  // the server still works on older runtimes.
+  if (typeof AbortSignal.timeout === 'function') return AbortSignal.timeout(REDIS_TIMEOUT_MS);
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(), REDIS_TIMEOUT_MS);
+  return ctrl.signal;
+}
+
+async function redisCall(command, member) {
+  const body = member === undefined ? [command, REDIS_KEY] : [command, REDIS_KEY, member];
+  const res = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: redisSignal(),
+  });
+  if (!res.ok) throw new Error(`Redis HTTP ${res.status}`);
+  const data = await res.json();
+  if (data && data.error) throw new Error(`Redis error: ${data.error}`);
+  return data ? data.result : undefined;
+}
+
+// Returns true/false when Redis answers, null when Redis is off / fails /
+// times out (caller then uses the local set).
+async function redisIsMember(proofTx) {
+  if (!REDIS_ENABLED) return null;
+  try {
+    const result = await redisCall('SISMEMBER', proofTx);
+    return result === 1 || result === '1';
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SISMEMBER failed, using local seen-set:', e.message);
+    return null;
+  }
+}
+
+// Fire-and-forget record. Returns true on success, false otherwise; never
+// throws. Callers MUST NOT await this before answering the task.
+async function redisAdd(proofTx) {
+  if (!REDIS_ENABLED) return false;
+  try {
+    await redisCall('SADD', proofTx);
+    if (redisSeenCount !== null) redisSeenCount += 1;
+    return true;
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SADD failed, proof_tx recorded locally only:', e.message);
+    return false;
+  }
+}
+
+async function redisCount() {
+  if (!REDIS_ENABLED) return null;
+  try {
+    const result = await redisCall('SCARD');
+    const n = Number(result);
+    return Number.isFinite(n) ? n : null;
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SCARD failed:', e.message);
+    return null;
+  }
+}
+
+// Dummy-test-data guard. The repo's seen.json holds only placeholder values
+// (0xad1aaa..., 0x1aaa..., 0xede1aaa... — long runs of 'a'). Real
+// proof_tx values are (pseudo-)random hex; 10+ consecutive 'a's in one
+// is effectively impossible. Never seed Redis with placeholders.
+function isDummyProofTx(v) {
+  if (typeof v !== 'string') return true;
+  const hex = v.replace(/^0x/, '');
+  if (!/^0x[0-9a-fA-F]+$/.test(v)) return true;
+  if (/a{10,}/i.test(hex)) return true;
+  const aCount = (hex.match(/a/gi) || []).length;
+  return hex.length > 0 && aCount / hex.length > 0.5;
+}
+
+// One-time guarded backfill. Runs ONLY when GATEKEEPER_REDIS_BACKFILL=1.
+// - If Redis already has members (SCARD > 0): do nothing. Redis wins.
+// - If Redis is empty: SADD each non-dummy entry of the LOCAL file.
+//   On Railway the file baked into the image comes from git, and seen.json
+//   is gitignored, so this normally seeds NOTHING there — that is the safe
+//   behaviour. It only seeds something when an operator has deliberately
+//   placed a real snapshot file next to the server before starting it.
+// - Proof_tx values lost in earlier redeploys (all of R04) CANNOT be
+//   recovered by this function. See REDIS_PATCH_NOTES.md.
+async function maybeBackfillRedisFromLocal() {
+  if (!REDIS_ENABLED || process.env.GATEKEEPER_REDIS_BACKFILL !== '1') return;
+  try {
+    const count = await redisCount();
+    if (count === null) { console.warn('[gatekeeper] backfill skipped: Redis SCARD unreadable'); return; }
+    if (count > 0) { console.log(`[gatekeeper] backfill skipped: Redis already has ${count} members`); return; }
+    const local = loadJson(SEEN_PATH, []);
+    const valid = (Array.isArray(local) ? local : []).filter((x) => !isDummyProofTx(x));
+    const skipped = (Array.isArray(local) ? local.length : 0) - valid.length;
+    if (valid.length === 0) { console.log(`[gatekeeper] backfill skipped: no valid local entries (skipped ${skipped} dummy)`); return; }
+    let added = 0;
+    for (const member of valid) { if (await redisAdd(member)) added += 1; }
+    console.log(`[gatekeeper] backfill done: seeded ${added}/${valid.length} local entries to Redis (skipped ${skipped} dummy)`);
+    redisSeenCount = await redisCount();
+  } catch (e) {
+    console.warn('[gatekeeper] backfill failed (non-fatal):', e.message);
+  }
+}
+
+// Startup refresh: fetch SCARD once (fire-and-forget) + optional backfill.
+// Neither blocks listen().
+if (REDIS_ENABLED) {
+  redisCount().then((n) => { if (n !== null) redisSeenCount = n; });
+  maybeBackfillRedisFromLocal();
+}
 
 // ---------------------------------------------------------------- HMAC
 function hmacHex(secret, rawBody) {
@@ -160,6 +301,32 @@ function decide(input) {
   }
 
   return { decision: 'APPROVE', reason_code: 'VALID_CONDITION', proofTx };
+}
+
+// Async wrapper: identical checks, except the PROOF_REUSED trap also
+// consults Redis (the durable source of truth) when the local set does
+// not already contain the proof_tx.
+//
+// Implementation note: the sync decide() above is the single source of
+// trap ORDER (VK -> THRESHOLD -> REUSED(local) -> EXPIRED -> RECIPIENT ->
+// AMOUNT). decideAsync reuses it verbatim:
+//  - if decide() already REJECTs (any trap, incl. local REUSED), that
+//    verdict stands — no Redis call is needed, because the first failing
+//    trap in order decides the reason_code;
+//  - only on a local APPROVE (all circuit-visible checks pass) do we ask
+//    Redis. A Redis hit flips the verdict to REJECT/PROOF_REUSED.
+//  - Redis unknown (off / error / timeout) keeps the local APPROVE —
+//    Redis must never fail a task.
+async function decideAsync(input) {
+  const local = decide(input);
+  if (local.decision === 'REJECT') return local;
+  const proofTx = normHash(input.proof_tx || '');
+  if (!proofTx) return local;
+  const inRedis = await redisIsMember(proofTx);
+  if (inRedis === true) {
+    return { decision: 'REJECT', reason_code: 'PROOF_REUSED', proofTx };
+  }
+  return local;
 }
 
 // ---------------------------------------------------------------- proof
@@ -343,7 +510,7 @@ async function handleTask(req, res, rawBody) {
   }
   if (!result) {
     try {
-      result = decide(task.input);
+      result = await decideAsync(task.input);
     } catch (e) {
       console.error('[gatekeeper] decide error (fail closed):', e.message);
       result = { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH', proofTx: normHash(task.input.proof_tx || '') };
@@ -383,7 +550,16 @@ async function handleTask(req, res, rawBody) {
   }
 
   // 6. Record proof_tx as seen + cache decision by task_id (persisted).
-  if (result.proofTx) { seenProofTx.add(result.proofTx); saveJson(SEEN_PATH, [...seenProofTx]); }
+  // Local set first (unchanged), then Redis — fire-and-forget, NEVER
+  // awaited before answering. redisAdd() never throws.
+  // NOTE: only the INPUT proof_tx is recorded. The Kurier txHash that may
+  // replace response.proof_tx is our own submission hash, never a platform
+  // input, so it must NOT enter the seen-set.
+  if (result.proofTx) {
+    seenProofTx.add(result.proofTx);
+    saveJson(SEEN_PATH, [...seenProofTx]);
+    void redisAdd(result.proofTx);
+  }
   decisionsByTask[task.task_id] = response;
   saveJson(DECISIONS_PATH, decisionsByTask);
 
@@ -402,6 +578,26 @@ const server = http.createServer(async (req, res) => {
         hmac_configured: Boolean(HMAC_SECRET),
         kurier_configured: Boolean(KURIER_API_KEY),
         seen_proof_refs: seenProofTx.size,
+        redis_configured: REDIS_ENABLED,
+        redis_seen_count: redisSeenCount,
+      });
+    }
+    // GET /seen — snapshot of the live seen-set, for taking a backfill
+    // snapshot BEFORE a future redeploy. Disabled unless
+    // GATEKEEPER_SEEN_EXPORT=1, and requires the HMAC secret in the
+    // x-admin-secret header (same secret as the dashboard, never logged).
+    // Keep it OFF in normal operation; enable only in the gap, snapshot,
+    // then disable again. It intentionally does NOT exist on the current
+    // live server, so it cannot recover the set that is already live.
+    if (req.method === 'GET' && url.pathname === '/seen') {
+      if (process.env.GATEKEEPER_SEEN_EXPORT !== '1' || !HMAC_SECRET ||
+          req.headers['x-admin-secret'] !== HMAC_SECRET) {
+        return sendJson(res, 404, { error: 'not found' });
+      }
+      return sendJson(res, 200, {
+        ok: true, count: seenProofTx.size,
+        redis_configured: REDIS_ENABLED, redis_seen_count: redisSeenCount,
+        proof_tx: [...seenProofTx],
       });
     }
     if (req.method === 'POST' && (url.pathname === '/agent' || url.pathname === '/')) {
@@ -418,8 +614,8 @@ const server = http.createServer(async (req, res) => {
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`[gatekeeper] listening on http://${HOST}:${PORT} (POST /agent, GET /health)`);
-    console.log(`[gatekeeper] hmac_configured=${Boolean(HMAC_SECRET)} kurier_configured=${Boolean(KURIER_API_KEY)}`);
+    console.log(`[gatekeeper] hmac_configured=${Boolean(HMAC_SECRET)} kurier_configured=${Boolean(KURIER_API_KEY)} redis_configured=${REDIS_ENABLED} seen_local=${seenProofTx.size} redis_seen_count=${redisSeenCount}`);
   });
 }
 
-module.exports = { server, decide, verifySignature, hmacHex, taskIdToField, addrToField, vkHashToField, buildCircuitInput };
+module.exports = { server, decide, decideAsync, verifySignature, hmacHex, taskIdToField, addrToField, vkHashToField, buildCircuitInput, redisIsMember, redisAdd, isDummyProofTx, REDIS_ENABLED, REDIS_KEY };
