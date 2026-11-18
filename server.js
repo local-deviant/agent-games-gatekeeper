@@ -379,10 +379,12 @@ function withTimeout(promise, ms, label) {
 // The platform scores -2 "proof_failure" per task when the proof is not
 // confirmed on-chain (observed R04: 0/2 verified, hi5 identical despite a
 // different encoding; top agents with Kurier verify). Requires KURIER_API_KEY
-// (mainnet, free). Awaited with a bounded budget inside the 60s task
-// deadline: submit the proof, poll job-status until Finalized, and return
-// the on-chain tx hash to use as response.proof_tx. Any failure returns
-// null (non-fatal) and the caller keeps the platform's input proof_tx echo.
+// (mainnet, free). Runs in the BACKGROUND (fire-and-forget): submit the
+// proof, poll job-status until Finalized, log the on-chain tx hash. The
+// txHash is NEVER written into response.proof_tx — proof_tx must echo the
+// task's input reference (the platform's audit pointer); substituting the
+// Kurier txHash caused -2 proof_failure on all three R06 live tasks while
+// practice tasks (echo kept) verified. Any failure returns null (non-fatal).
 const KURIER_TIMEOUT_MS = parseInt(process.env.KURIER_TIMEOUT_MS || '40000', 10);
 const KURIER_POLL_MS = 3000;
 
@@ -532,16 +534,16 @@ async function handleTask(req, res, rawBody) {
       response.proof = proof;
       response.public_signals = public_signals;
       console.log(`[gatekeeper] ${task.task_id} ${result.decision}/${result.reason_code} proof ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-      // Kurier: submit + wait for Finalized (bounded by the task deadline),
-      // then use the on-chain tx hash as proof_tx so the platform counts
-      // the proof as verified. On any failure keep the echo proof_tx.
-      const deadlineMs = task.deadline_at ? Date.parse(task.deadline_at) : 0;
-      let kurierBudget = KURIER_TIMEOUT_MS;
-      if (deadlineMs) kurierBudget = Math.min(kurierBudget, deadlineMs - Date.now() - 5000);
-      if (kurierBudget > 0) {
-        const txHash = await submitToKurier(proof, public_signals, kurierBudget);
-        if (txHash) response.proof_tx = txHash;
-      }
+      // Kurier: submit in the BACKGROUND (fire-and-forget) for on-chain
+      // confirmation; NEVER block the response and NEVER replace
+      // response.proof_tx with the Kurier txHash. proof_tx is the
+      // platform's audit pointer: it must echo the task's input
+      // proof_tx. Replacing it with the Kurier txHash caused -2
+      // proof_failure on every live task (R06 tasks 1-3), while practice
+      // tasks (Kurier unconfigured, echo kept) verified fine. The
+      // reference implementation (ibank-agent, rank 11) does the same:
+      // echo proof_tx, Kurier in the background.
+      void submitToKurier(proof, public_signals, KURIER_TIMEOUT_MS);
     } catch (e) {
       console.error(`[gatekeeper] ${task.task_id} proof FAILED (decision still returned):`, e.message);
     }
