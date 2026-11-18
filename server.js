@@ -384,16 +384,25 @@ function withTimeout(promise, ms, label) {
 // hash. The txHash is NEVER written into response.proof_tx — proof_tx must
 // echo the task's input reference (the platform's audit pointer). History:
 // block+substitute (R06 tasks 1-3) → -2 each; background+echo (task 4) →
-// -2. The guide says "Finalized is the state that is safe to return as
-// confirmed", so block+echo is the remaining combination. Any failure
+// -2; block+echo (tasks 5-6) → -2 each. And the proof itself is NOT the
+// problem: a practice proof was verified locally with snarkjs against the
+// VK on 2026-11-19 00:46 WIB → VALID. So the remaining axis is WHERE the
+// proof is confirmed: without chainId Kurier is verify-only on the
+// zkVerify chain (docs: "the endpoint of verify-only is the ProofVerified
+// event", no publication to a destination chain) — and our txHashes were
+// NOT findable on BaseScan. With chainId the job goes
+// AggregationPending → Aggregated → AggregationPublished on the
+// destination chain (Base mainnet 8453, env KURIER_CHAIN_ID). Any failure
 // returns null (non-fatal) and the caller keeps the echo proof_tx.
 const KURIER_TIMEOUT_MS = parseInt(process.env.KURIER_TIMEOUT_MS || '40000', 10);
 const KURIER_POLL_MS = 3000;
+const KURIER_CHAIN_ID = parseInt(process.env.KURIER_CHAIN_ID || '8453', 10);
 
 async function kurierSubmitOnce(proof, publicSignals, vkRegistered) {
   const body = {
     proofType: 'groth16',
     vkRegistered,
+    chainId: KURIER_CHAIN_ID,
     proofOptions: { library: 'snarkjs', curve: 'bn128' },
     proofData: { proof, publicSignals, vk: vkRegistered ? VK_HASH : vk },
   };
@@ -413,8 +422,15 @@ async function kurierPoll(jobId, deadlineMs) {
     if (res.ok) {
       const st = await res.json();
       const status = String(st.status || st.state || '').toLowerCase();
-      if (status === 'finalized' || status === 'success' || status === 'verified') {
-        return st.txHash || st.tx_hash || st.transactionHash || st.proofTx || null;
+      // Aggregation path (chainId set): Finalized = verified on zkVerify;
+      // Aggregated / AggregationPublished = published to the destination
+      // chain (Base). Either is a confirmed result; prefer the
+      // aggregation receipt when present.
+      if (status === 'finalized' || status === 'success' || status === 'verified' ||
+          status === 'aggregated' || status === 'aggregationpublished') {
+        const agg = st.aggregationDetails || st.aggregation_details || null;
+        return st.txHash || st.tx_hash || st.transactionHash || st.proofTx ||
+          (agg && (agg.receipt || agg.txHash || agg.transactionHash)) || null;
       }
       if (status === 'failed' || status === 'error' || status === 'rejected') {
         throw new Error('kurier job ' + status);
@@ -539,12 +555,14 @@ async function handleTask(req, res, rawBody) {
       // Kurier: submit and WAIT for Finalized (bounded by the task
       // deadline), but NEVER replace response.proof_tx with the Kurier
       // txHash — proof_tx must echo the task's input reference (the
-      // platform's audit pointer). Two failed combinations so far: (1)
+      // platform's audit pointer). Failed combinations so far: (1)
       // block + substitute txHash (R06 tasks 1-3) → -2 proof_failure;
-      // (2) background + echo (task 4) → -2 proof_failure. The build
-      // guide says "Finalized is the state that is safe to return as
-      // confirmed", so the on-chain confirmation must exist BEFORE the
-      // response is scored — block + echo is the remaining combination.
+      // (2) background + echo (task 4) → -2; (3) block + echo
+      // (tasks 5-6) → -2. The proof itself is valid (snarkjs-verified
+      // locally vs the VK, 2026-11-19). Current hypothesis: without
+      // chainId Kurier is verify-only, so nothing is published to Base
+      // for the platform to find — submit now carries chainId 8453
+      // (Base) for aggregation + publication.
       const deadlineMs = task.deadline_at ? Date.parse(task.deadline_at) : 0;
       let kurierBudget = KURIER_TIMEOUT_MS;
       if (deadlineMs) kurierBudget = Math.min(kurierBudget, deadlineMs - Date.now() - 5000);
