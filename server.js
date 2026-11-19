@@ -234,14 +234,30 @@ function toBigInt(v) {
   if (/^0x/i.test(s)) return BigInt(s);
   return BigInt(s);
 }
-// task_id like "gk_24_9d1" is a string; the circuit takes a field element.
-// Encoding (GUESS — see GATEKEEPER_BUILD.md open questions): UTF-8 bytes
-// as one big-endian integer. Short ids fit in the field; long ones wrap mod p.
+function sha256Hex(str) {
+  return '0x' + crypto.createHash('sha256').update(String(str || ''), 'utf8').digest('hex');
+}
+let keccak256HexFn = null;
+function keccak256Hex(str) {
+  if (!keccak256HexFn) keccak256HexFn = require('js-sha3').keccak_256;
+  return '0x' + keccak256HexFn(Buffer.from(String(str || ''), 'utf8'));
+}
+// taskId encoding — FIXED 19 Nov 2026 (hi5/Cervus finding, commit 599aeff):
+// the platform expects public signal [12] (taskId) to be the BigInt of the
+// task UUID hex (dashes stripped). A UUID is 128 bits, FIELD_P ~254 bits,
+// so it fits exactly (no mod wrap). This mirrors how the Steal circuit
+// treats matchId (bytes32). Previous encodings were all DISPROVEN live:
+// UTF-8 big-endian integer (ours — every correct R06 task scored +10 with
+// proof_failure), keccak256 (Cervus, +10), sha256 (Cervus R06 task 2,
+// 19:54 WIB, +10). Verified by probe 19 Nov 07:xx WIB: a live practice
+// task's signal[12] == utf8-bigendian(taskId) exactly, confirming [12]
+// is the taskId and our old encoding. Non-UUID ids (practice/probe)
+// fall back to sha256 so the harness keeps working.
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 function taskIdToField(taskId) {
-  const bytes = Buffer.from(String(taskId || ''), 'utf8');
-  let n = 0n;
-  for (const b of bytes) n = (n << 8n) | BigInt(b);
-  return (n % FIELD_MODULUS).toString();
+  const m = String(taskId || '').match(UUID_RE);
+  if (m) return (BigInt('0x' + m[0].replace(/-/g, '')) % FIELD_MODULUS).toString();
+  return (BigInt(sha256Hex(taskId)) % FIELD_MODULUS).toString();
 }
 function addrToField(addr) {
   const n = BigInt('0x' + (normAddr(addr) || '0'));
@@ -351,7 +367,14 @@ function buildCircuitInput(task, result) {
     currentBlock: toBigInt(input.current_block).toString(),
     decision: result.decision === 'APPROVE' ? '1' : '0',
     taskId: taskIdToField(task.task_id),
-    salt: BigInt('0x' + crypto.randomBytes(16).toString('hex')).toString(),
+    // Salt — CHANGED 19 Nov 2026 to match the working reference
+    // (Cervus commit 599aeff, which scores +12): keccak256("salt:"+task_id),
+    // deterministic per task so a retry produces identical proof inputs.
+    // Ours was crypto.randomBytes(16) — a random salt can never be
+    // re-derived by the platform, so if it checks the salt signal it
+    // could never match. (hi5's "don't change the salt" assumed it was
+    // already this keccak value — ours wasn't.)
+    salt: (BigInt(keccak256Hex(`salt:${task.task_id}`)) % FIELD_MODULUS).toString(),
     registeredVkHash: vkHashToField(input.registered_vk),
     proofVkHash: vkHashToField(input.proof_vk),
   };
