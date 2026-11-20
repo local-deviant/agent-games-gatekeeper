@@ -560,6 +560,9 @@ async function handleTask(req, res, rawBody) {
     }
   }
 
+  // R08 diagnostic (2026-11-20, one line, no logic change): log the decision inputs so a wrong APPROVE/REJECT can be traced to the failing check. No secrets: no HMAC secret, Kurier key, salt or raw proof/vk — hashes truncated.
+  console.log(`[gatekeeper] DECISION_INPUT ${task.task_id} ${result.decision}/${result.reason_code} balance=${task.input.public_balance} minimum=${task.input.minimum} amount=${task.input.amount} max_transfer=${task.input.max_transfer} expiry_block=${task.input.expiry_block} current_block=${task.input.current_block} recipient=${normAddr(task.input.recipient)} condition_recipient=${normAddr(task.input.condition_recipient)} proof_tx_sha256=${sha256Hex(task.input.proof_tx || '').slice(0, 18)} registered_vk_sha256=${sha256Hex(task.input.registered_vk || '').slice(0, 18)} proof_vk_sha256=${sha256Hex(task.input.proof_vk || '').slice(0, 18)}`);
+
   // 5. Proof. PROOF_REUSED tasks have no proof to submit (platform scoring
   // note) and are excluded from the reliability bonus — omit proof there.
   // Every other task gets a local Groth16 proof; if proving fails or times
